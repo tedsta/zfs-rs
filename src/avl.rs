@@ -10,6 +10,7 @@ impl<T> Node<T> {
     pub fn value(&self) -> &T {
         &self.value
     }
+
     pub fn left<K>(&self, tree: &Tree<T, K>) -> Option<NodeId> {
         self.left.map(|l| {
             NodeId {
@@ -18,6 +19,7 @@ impl<T> Node<T> {
             }
         })
     }
+
     pub fn right<K>(&self, tree: &Tree<T, K>) -> Option<NodeId> {
         self.right.map(|r| {
             NodeId {

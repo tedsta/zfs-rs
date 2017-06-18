@@ -61,20 +61,16 @@ pub struct ZfsReader {
 
 impl ZfsReader {
     pub fn read_block(&mut self, block_ptr: &BlockPtr) -> Result<Vec<u8>, String> {
-        let data = self.arc.read(&mut self.zio, &block_ptr.dvas[0]);
+        let data = self.arc.read(&mut self.zio, &block_ptr.dvas[0])?;
         match block_ptr.compression() {
             2 => {
                 // compression off
-                data
+                Ok(data)
             }
             1 | 3 => {
                 // lzjb compression
                 let mut decompressed = vec![0; (block_ptr.lsize()*512) as usize];
-                lzjb::decompress(&match data {
-                                     Ok(data) => data,
-                                     Err(e) => return Err(e),
-                                 },
-                                 &mut decompressed);
+                lzjb::decompress(&data, &mut decompressed);
                 Ok(decompressed)
             }
             u => Err(format!("Error: Unknown compression type {}", u)),
@@ -417,205 +413,209 @@ fn main() {
         print!("# ");
         stdout().flush();
 
-        if let Some(line) = readln!() {
-            let args: Vec<String> = line.trim().split(' ').map(|arg| arg.to_string()).collect();
+        let line = readln!().expect("Failed to read line");
 
-            if let Some(command) = args.get(0) {
-                let mut close = false;
-                match zfs_option {
-                    Some(ref mut zfs) => {
-                        if command == "uber" {
-                            let ref uberblock = zfs.uberblock;
-                            // 128 KB of ubers after 128 KB of other stuff
-                            println!("Newest Uberblock {:X}", zfs.uberblock.magic);
-                            println!("Version {}", uberblock.version);
-                            println!("TXG {}", uberblock.txg);
-                            println!("GUID {:X}", uberblock.guid_sum);
-                            println!("Timestamp {}", uberblock.timestamp);
-                            println!("ROOTBP[0] {:?}", uberblock.rootbp.dvas[0]);
-                            println!("ROOTBP[1] {:?}", uberblock.rootbp.dvas[1]);
-                            println!("ROOTBP[2] {:?}", uberblock.rootbp.dvas[2]);
-                        } else if command == "spa_import" {
-                            let mut nvpairs_buffer = zfs.reader.zio.read(32, 224);
-                            let mut xdr = xdr::MemOps::new(&mut nvpairs_buffer);
+        let args: Vec<String> = line.trim().split(' ').map(|arg| arg.to_string()).collect();
+
+        let command = if let Some(command) = args.get(0) {
+            command
+        } else {
+            println!("Commands: uber spa_import vdev_label file ls dump close exit");
+            continue;
+        };
+        
+        let mut close = false;
+        match zfs_option {
+            Some(ref mut zfs) => {
+                if command == "uber" {
+                    let ref uberblock = zfs.uberblock;
+                    // 128 KB of ubers after 128 KB of other stuff
+                    println!("Newest Uberblock {:X}", zfs.uberblock.magic);
+                    println!("Version {}", uberblock.version);
+                    println!("TXG {}", uberblock.txg);
+                    println!("GUID {:X}", uberblock.guid_sum);
+                    println!("Timestamp {}", uberblock.timestamp);
+                    println!("ROOTBP[0] {:?}", uberblock.rootbp.dvas[0]);
+                    println!("ROOTBP[1] {:?}", uberblock.rootbp.dvas[1]);
+                    println!("ROOTBP[2] {:?}", uberblock.rootbp.dvas[2]);
+                } else if command == "spa_import" {
+                    let mut nvpairs_buffer = zfs.reader.zio.read(32, 224);
+                    let mut xdr = xdr::MemOps::new(&mut nvpairs_buffer);
+                    let nv_list = nvstream::decode_nv_list(&mut xdr).unwrap();
+                    let name = nv_list.get::<&String>("name").unwrap().clone();
+                    let spa = spa::Spa::import(name, nv_list).unwrap();
+                } else if command == "vdev_label" {
+                    match VdevLabel::from_bytes(&zfs.reader.zio.read(0, 256 * 2)) {
+                        Ok(ref mut vdev_label) => {
+                            let mut xdr = xdr::MemOps::new(&mut vdev_label.nv_pairs);
                             let nv_list = nvstream::decode_nv_list(&mut xdr).unwrap();
-                            let name = nv_list.get::<&String>("name").unwrap().clone();
-                            let spa = spa::Spa::import(name, nv_list).unwrap();
-                        } else if command == "vdev_label" {
-                            match VdevLabel::from_bytes(&zfs.reader.zio.read(0, 256 * 2)) {
-                                Ok(ref mut vdev_label) => {
-                                    let mut xdr = xdr::MemOps::new(&mut vdev_label.nv_pairs);
-                                    let nv_list = nvstream::decode_nv_list(&mut xdr).unwrap();
-                                    println!("Got nv_list:\n{:?}", nv_list);
-                                    match nv_list.find("vdev_tree") {
-                                        Some(vdev_tree) => {
-                                            println!("Got vdev_tree");
+                            println!("Got nv_list:\n{:?}", nv_list);
+                            match nv_list.find("vdev_tree") {
+                                Some(vdev_tree) => {
+                                    println!("Got vdev_tree");
 
-                                            let vdev_tree = if let NvValue::NvList(ref vdev_tree) =
-                                                                   *vdev_tree {
-                                                Some(vdev_tree)
+                                    let vdev_tree = if let NvValue::NvList(ref vdev_tree) =
+                                                           *vdev_tree {
+                                        Some(vdev_tree)
+                                    } else {
+                                        None
+                                    };
+
+                                    match vdev_tree.unwrap().find("metaslab_array") {
+                                        Some(metaslab_array) => {
+                                            println!("Got metaslab_array");
+                                            if let NvValue::Uint64(metaslab_array) =
+                                                   *metaslab_array {
+                                                // Get metaslab array dnode
+                                                let metaslab_array = metaslab_array as usize;
+                                                let ma_dnode: Result<DNodePhys, String> =
+                                                    zfs.reader
+                                                       .read_type_array(zfs.mos
+                                                                           .meta_dnode
+                                                                           .get_blockptr(0),
+                                                                        metaslab_array);
+                                                let ma_dnode = ma_dnode.unwrap(); // TODO
+
+                                                // Get a spacemap object id
+                                                let sm_id: Result<u64, String> =
+                                                    zfs.reader.read_type_array(ma_dnode.get_blockptr(0), 0);
+                                                let sm_id = sm_id.unwrap(); // TODO
+
+                                                let sm_dnode: Result<DNodePhys, String> =
+                                                    zfs.reader
+                                                       .read_type_array(zfs.mos
+                                                                           .meta_dnode
+                                                                           .get_blockptr(0),
+                                                                        sm_id as usize);
+                                                let sm_dnode = sm_dnode.unwrap(); // TODO
+                                                let space_map_phys = SpaceMapPhys::from_bytes(sm_dnode.get_bonus()).unwrap(); // TODO
+                                                let space_map: Result<Vec<u8>, String> =
+                                                    zfs.reader
+                                                       .read_block(sm_dnode.get_blockptr(0));
+
+                                                println!("got space map id: {:?}", sm_id);
+                                                println!("got space map dnode: {:?}", sm_dnode);
+                                                println!("got space map phys: {:?}",
+                                                         space_map_phys);
+                                                // println!("got space map: {:?}", &space_map.unwrap()[0..64]);
+
+                                                let mut range_tree: avl::Tree<space_map::Entry,
+                                                                              u64> =
+                                                    avl::Tree::new(Rc::new(|x| x.offset()));
+                                                // space_map::load_space_map_avl(&space_map::SpaceMap { size: 30 },
+                                                // &mut range_tree,
+                                                // &space_map.unwrap(),
+                                                // space_map::MapType::Alloc).unwrap();
                                             } else {
-                                                None
-                                            };
-
-                                            match vdev_tree.unwrap().find("metaslab_array") {
-                                                Some(metaslab_array) => {
-                                                    println!("Got metaslab_array");
-                                                    if let NvValue::Uint64(metaslab_array) =
-                                                           *metaslab_array {
-                                                        // Get metaslab array dnode
-                                                        let metaslab_array = metaslab_array as usize;
-                                                        let ma_dnode: Result<DNodePhys, String> =
-                                                            zfs.reader
-                                                               .read_type_array(zfs.mos
-                                                                                   .meta_dnode
-                                                                                   .get_blockptr(0),
-                                                                                metaslab_array);
-                                                        let ma_dnode = ma_dnode.unwrap(); // TODO
-
-                                                        // Get a spacemap object id
-                                                        let sm_id: Result<u64, String> =
-                                                            zfs.reader.read_type_array(ma_dnode.get_blockptr(0), 0);
-                                                        let sm_id = sm_id.unwrap(); // TODO
-
-                                                        let sm_dnode: Result<DNodePhys, String> =
-                                                            zfs.reader
-                                                               .read_type_array(zfs.mos
-                                                                                   .meta_dnode
-                                                                                   .get_blockptr(0),
-                                                                                sm_id as usize);
-                                                        let sm_dnode = sm_dnode.unwrap(); // TODO
-                                                        let space_map_phys = SpaceMapPhys::from_bytes(sm_dnode.get_bonus()).unwrap(); // TODO
-                                                        let space_map: Result<Vec<u8>, String> =
-                                                            zfs.reader
-                                                               .read_block(sm_dnode.get_blockptr(0));
-
-                                                        println!("got space map id: {:?}", sm_id);
-                                                        println!("got space map dnode: {:?}", sm_dnode);
-                                                        println!("got space map phys: {:?}",
-                                                                 space_map_phys);
-                                                        // println!("got space map: {:?}", &space_map.unwrap()[0..64]);
-
-                                                        let mut range_tree: avl::Tree<space_map::Entry,
-                                                                                      u64> =
-                                                            avl::Tree::new(Rc::new(|x| x.offset()));
-                                                        // space_map::load_space_map_avl(&space_map::SpaceMap { size: 30 },
-                                                        // &mut range_tree,
-                                                        // &space_map.unwrap(),
-                                                        // space_map::MapType::Alloc).unwrap();
-                                                    } else {
-                                                        println!("Invalid metaslab_array NvValue \
-                                                                  type. Expected Uint64.");
-                                                    }
-                                                }
-                                                None => {
-                                                    println!("No `metaslab_array` in vdev_tree");
-                                                }
-                                            };
+                                                println!("Invalid metaslab_array NvValue \
+                                                          type. Expected Uint64.");
+                                            }
                                         }
                                         None => {
-                                            println!("No `vdev_tree` in vdev_label nvpairs");
+                                            println!("No `metaslab_array` in vdev_tree");
                                         }
-                                    }
+                                    };
                                 }
-                                Err(e) => {
-                                    println!("Couldn't read vdev_label: {}", e);
+                                None => {
+                                    println!("No `vdev_tree` in vdev_label nvpairs");
                                 }
                             }
-                        } else if command == "file" {
-                            match args.get(1) {
-                                Some(arg) => {
-                                    let file = zfs.read_file(arg);
-                                    match file {
-                                        Some(file) => {
-                                            println!("File contents: {}",
-                                                     str::from_utf8(&file).unwrap());
-                                        }
-                                        None => println!("Failed to read file"),
-                                    }
+                        }
+                        Err(e) => {
+                            println!("Couldn't read vdev_label: {}", e);
+                        }
+                    }
+                } else if command == "file" {
+                    match args.get(1) {
+                        Some(arg) => {
+                            let file = zfs.read_file(arg);
+                            match file {
+                                Some(file) => {
+                                    println!("File contents: {}",
+                                             str::from_utf8(&file).unwrap());
                                 }
-                                None => println!("Usage: file <path>"),
+                                None => println!("Failed to read file"),
                             }
-                        } else if command == "ls" {
-                            match args.get(1) {
-                                Some(arg) => {
-                                    let ls = zfs.ls(arg);
-                                    match ls {
-                                        Some(ls) => {
-                                            for item in &ls {
-                                                print!("{}\t", item);
-                                            }
-                                        }
-                                        None => println!("Failed to read directory"),
+                        }
+                        None => println!("Usage: file <path>"),
+                    }
+                } else if command == "ls" {
+                    match args.get(1) {
+                        Some(arg) => {
+                            let ls = zfs.ls(arg);
+                            match ls {
+                                Some(ls) => {
+                                    for item in &ls {
+                                        print!("{}\t", item);
                                     }
+                                    println!("");
                                 }
-                                None => println!("Usage: ls <path>"),
+                                None => println!("Failed to read directory"),
                             }
-                        } else if command == "dump" {
-                            match args.get(1) {
-                                Some(arg) => {
-                                    if let Ok(sector) = arg.parse::<usize>() {
-                                        println!("Dump sector: {}", sector);
+                        }
+                        None => println!("Usage: ls <path>"),
+                    }
+                } else if command == "dump" {
+                    match args.get(1) {
+                        Some(arg) => {
+                            if let Ok(sector) = arg.parse::<usize>() {
+                                println!("Dump sector: {}", sector);
 
-                                        let data = zfs.reader.zio.read(sector, 1);
-                                        for i in 0..data.len() {
-                                            if i % 32 == 0 {
-                                                print!("\n{:X}:", i);
-                                            }
-                                            if let Some(byte) = data.get(i) {
-                                                print!(" {:X}", *byte);
-                                            } else {
-                                                println!(" !");
-                                            }
-                                        }
-                                        print!("\n");
+                                let data = zfs.reader.zio.read(sector, 1);
+                                for i in 0..data.len() {
+                                    if i % 32 == 0 {
+                                        print!("\n{:X}:", i);
+                                    }
+                                    if let Some(byte) = data.get(i) {
+                                        print!(" {:X}", *byte);
                                     } else {
-                                        println!("Sector not a number");
+                                        println!(" !");
                                     }
                                 }
-                                None => println!("No sector specified!"),
+                                print!("\n");
+                            } else {
+                                println!("Sector not a number");
                             }
-                        } else if command == "close" {
-                            println!("Closing");
-                            close = true;
-                        } else if command == "exit" {
-                            break 'reading;
-                        } else {
-                            println!("Commands: uber vdev_label file ls dump close exit");
                         }
+                        None => println!("No sector specified!"),
                     }
-                    None => {
-                        if command == "open" {
-                            match args.get(1) {
-                                Some(arg) => {
-                                    match File::open(arg) {
-                                        Ok(file) => {
-                                            let zfs = Zfs::new(file);
-                                            if let Err(ref e) = zfs {
-                                                println!("Error: {:?}", e);
-                                            } else {
-                                                println!("Open: {}", arg);
-                                            }
-                                            zfs_option = zfs.ok();
-                                        }
-                                        Err(err) => println!("Failed to open {}: {}", arg, err),
-                                    }
-                                }
-                                None => println!("No file specified!"),
-                            }
-                        } else if command == "exit" {
-                            break 'reading;
-                        } else {
-                            println!("Commands: open exit");
-                        }
-                    }
-                }
-                if close {
-                    zfs_option = None;
+                } else if command == "close" {
+                    println!("Closing");
+                    close = true;
+                } else if command == "exit" {
+                    break 'reading;
+                } else {
+                    println!("Commands: uber spa_import vdev_label file ls dump close exit");
                 }
             }
-        } else {
-            break 'reading;
+            None => {
+                if command == "open" {
+                    match args.get(1) {
+                        Some(arg) => {
+                            match File::open(arg) {
+                                Ok(file) => {
+                                    let zfs = Zfs::new(file);
+                                    if let Err(ref e) = zfs {
+                                        println!("Error: {:?}", e);
+                                    } else {
+                                        println!("Open: {}", arg);
+                                    }
+                                    zfs_option = zfs.ok();
+                                }
+                                Err(err) => println!("Failed to open {}: {}", arg, err),
+                            }
+                        }
+                        None => println!("No file specified!"),
+                    }
+                } else if command == "exit" {
+                    break 'reading;
+                } else {
+                    println!("Commands: open exit");
+                }
+            }
+        }
+        if close {
+            zfs_option = None;
         }
     }
 }
